@@ -45,7 +45,6 @@ Wallets and mints `MUST` implement all mandatory specs and `CAN` implement optio
 | [27][27] | Nostr Mint Backup                 | [Cashu.me][cashume], [cdk]                                                     | -                                                |
 | [28][28] | Pay to Blinded Key (P2BK)         | [cdk], [cashu-ts][ts]                                                          | -                                                |
 | [29][29] | Batched Mint                      | -                                                                              | -                                                |
-| [30][30] | BLS12-381 Keyset                  | -                                                                              | -                                                |
 
 #### Wallets
 
@@ -104,4 +103,3 @@ Wallets and mints `MUST` implement all mandatory specs and `CAN` implement optio
 [27]: 27.md
 [28]: 28.md
 [29]: 29.md
-[30]: 30.md
