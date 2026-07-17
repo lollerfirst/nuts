@@ -117,14 +117,30 @@ Every epoch interval (e.g., 24 hours), the mint constructs and signs an Epoch Ma
    - Submit the **Global Digest** to OpenTimestamps (OTS) calendar servers to obtain an initial _pending_ (incomplete) receipt.
    - **Mint Upgrade Burden:** The mint MUST monitor the calendar server, upgrade the pending `.ots` receipt to an _anchored_ (completed) state once the transaction has been confirmed on the Bitcoin blockchain, and republish the fully upgraded, offline-verifiable `.ots` receipt alongside the manifest.
 5. **Manifest Message:** Construct a colon-separated UTF-8 string:
-   `"{keyset_id}:{epoch_index}:{timestamp}:{previous_global_digest}:{issued_mmr_size}:{issued_mmr_root_hash}:{issued_mmr_root_sum}:{spent_mmr_size}:{spent_mmr_root_hash}:{spent_mmr_root_sum}:{outstanding_balance}"`
+   `"{keyset_id}:{epoch_index}:{timestamp}:{previous_global_digest}:{issued_mmr_size}:{issued_mmr_root_hash}:{issued_mmr_root_sum}:{spent_mmr_size}:{spent_mmr_root_hash}:{spent_mmr_root_sum}:{outstanding_balance}:{active}:{deactivation}"`
    where:
    - `keyset_id` MUST be a lowercase hexadecimal string.
    - `timestamp` MUST be serialized as an RFC 3339 string with second precision, without fractional seconds, and strictly using uppercase `Z` for the UTC timezone (e.g., `2026-06-11T12:00:00Z`).
    - `previous_global_digest` MUST be serialized as a 64-character lowercase hexadecimal string.
    - `issued_mmr_root_hash` and `spent_mmr_root_hash` MUST be serialized as 64-character lowercase hexadecimal strings.
+   - `active` MUST be serialized as the literal lowercase string `true` or `false`, reflecting the keyset's `active` state as defined in NUT-02 at the moment the manifest is constructed (the epoch close).
+   - `deactivation` MUST be serialized as the canonical decimal unix timestamp (seconds, without leading zeros; non-negative and at most 2^53 - 1 for safe JSON interoperability) committed for this keyset's deactivation, or the literal string `null` when unset (see Keyset Lifecycle Commitments).
 6. **Signing:** Sign the message with a BIP-340 Schnorr signature using the mint's master NUT-06 private key signing the SHA256 digest of this serialized manifest string. Note that this signature is over the manifest metadata only and **excludes** the `ots_receipt` to allow upgrading the receipt without changing the signature or causing equivocation false-positives.
-7. **Publish:** Store and publish the signed manifests, signatures, OTS receipts, `global_digest`, and the ordered `epoch_keysets` array used to construct `commitment_data`. Each entry in `epoch_keysets` MUST contain the `keyset_id`, `issued_mmr_size`, `issued_mmr_root_hash`, `spent_mmr_size`, and `spent_mmr_root_hash`; the array MUST contain every unexpired keyset exactly once and match the corresponding signed manifests. This lets verifiers reconstruct the exact Global Digest preimage.
+7. **Publish:** Store and publish the signed manifests, signatures, OTS receipts, `global_digest`, and the ordered `epoch_keysets` array used to construct `commitment_data`. Each entry in `epoch_keysets` MUST contain the `keyset_id`, `issued_mmr_size`, `issued_mmr_root_hash`, `spent_mmr_size`, `spent_mmr_root_hash`, `active`, and `deactivation`; the array MUST contain every unexpired keyset exactly once and match the corresponding signed manifests. This lets verifiers reconstruct the exact Global Digest preimage, and lets a wallet survey every keyset's lifecycle from a single manifest request (verifying another keyset's lifecycle fields requires fetching that keyset's signed manifest). Note that `active` and `deactivation` are not part of `commitment_data`; they are authenticated by each keyset's signed manifest.
+
+### Keyset Lifecycle Commitments
+
+The redemption wind-down that catches spent-side inflation only begins once a keyset stops issuing. To make that moment verifiable rather than discretionary, each manifest carries the keyset's `active` status and a committed `deactivation` deadline, subject to the following rules.
+
+A keyset's **birth** is the epoch in which it first appears in `epoch_keysets`. Its birth time is that epoch's verified OTS block timestamp (from the attestation with the lowest block height), an anchored clock the mint does not control. A keyset's age and a mint's rotation history are therefore computable by anyone from the manifest history alone. A mint adopting this NUT mid-life enters all of its existing unexpired keysets at its first epoch; their pre-adoption history is unattested, and their birth for the purposes of this section is that first epoch.
+
+1. **Single Declaration:** `deactivation` MUST be set in the keyset's first manifest and MUST be identical in every subsequent manifest for that keyset. If it is `null` in the first manifest, it MUST remain `null` permanently. A non-null `deactivation` MUST be strictly less than the keyset's `final_expiry` where one exists.
+2. **Monotonic Status:** Once any manifest for a keyset contains `active: false`, every subsequent manifest for that keyset MUST also contain `active: false`.
+3. **Issued MMR Freeze:** A keyset's **lock epoch** is the first epoch in which its manifest contains `active: false`, whether by early deactivation or by deadline. From the lock epoch, its `issued_mmr_size`, `issued_mmr_root_hash`, and `issued_mmr_root_sum` MUST NOT change in any subsequent epoch. A keyset deactivated partway through an epoch closes that epoch with `active: false`, and its lock-epoch manifest reflects the final issued state, including any issuance that legitimately occurred earlier in that epoch before the deactivation moment. The freeze binds relative to that manifest.
+4. **Anchored Deadline:** A keyset MUST be `active: false` in every epoch whose manifest `timestamp` exceeds its `deactivation`. The anchored block time is an upper bound on the epoch close, not an exact time, so this rule binds against the signed `timestamp` — which Step 2.5 already bounds against the verified block time, limiting how far a mint can understate it.
+5. **Early Deactivation:** `deactivation` is an upper bound, not an exact date. A mint MAY deactivate a keyset at any earlier epoch.
+
+Wallets SHOULD treat a keyset whose `deactivation` is `null` (or beyond the wallet's acceptance policy) as carrying no rotation commitment, and treat ecash from it accordingly. Verifiers SHOULD additionally cross-check the keysets returned by `/v1/keysets` against `epoch_keysets` (a keyset's expiry is its NUT-02 `final_expiry`): an unexpired keyset MUST appear in every epoch commitment that closes after the keyset is first offered, and one that remains absent is an audit failure. Keysets newer than the latest closed epoch, and expired keysets a mint still lists for historical compatibility, are expected mismatches and not failures.
 
 ---
 
@@ -163,6 +179,8 @@ The `leaf_index` is not trusted metadata. A verifier MUST derive it from the pro
   "spent_mmr_root_hash": "4d1a...",
   "spent_mmr_root_sum": 450000,
   "outstanding_balance": 550000,
+  "active": true,
+  "deactivation": 1799999999,
   "global_digest": "7c6d...",
   "epoch_keysets": [
     {
@@ -170,7 +188,9 @@ The `leaf_index` is not trusted metadata. A verifier MUST derive it from the pro
       "issued_mmr_size": 125000,
       "issued_mmr_root_hash": "8f3c...",
       "spent_mmr_size": 52000,
-      "spent_mmr_root_hash": "4d1a..."
+      "spent_mmr_root_hash": "4d1a...",
+      "active": true,
+      "deactivation": 1799999999
     }
   ],
   "ots_receipt": "<hex_encoded_ots_file_content>",
@@ -288,6 +308,12 @@ To ensure the mint does not modify or delete historical entries from an epoch to
    - Let `k` be the length of the sibling path of the previous proof. The first `k` elements of the new proof's `sibling_path` MUST match the old proof's `sibling_path` exactly (in node hash, sum, and `is_left` positional boolean).
    - Any additional sibling nodes beyond index `k-1` in the new `sibling_path` represent subsequent peaks merged at higher mountain heights.
    - If this prefix match fails, the mint has modified, reordered, or deleted a past leaf (such as removing fabricated spent leaves), which constitutes an **audit failure**. Alternatively, external auditors can verify append-only extensions using standard MMR consistency proofs.
+3. **Keyset Lifecycle Consistency:** For each audited keyset, across any set of its signed manifests. Two sampled manifests verify these rules between themselves; a violation occurring strictly between two samples requires an intervening manifest to detect, which any observer may hold. The freeze check specifically requires a baseline at or after the lock epoch, so wallets SHOULD retain the lock-epoch manifest once they observe a keyset deactivate:
+   - `deactivation` MUST be identical in all of them.
+   - `active` MUST be monotone: no manifest may contain `active: true` at a later epoch than any manifest containing `active: false`.
+   - From the lock epoch, `issued_mmr_size`, `issued_mmr_root_hash`, and `issued_mmr_root_sum` MUST be unchanged relative to the lock-epoch manifest (which may itself show growth over the prior epoch, per the mid-epoch deactivation rule).
+   - `active` MUST be `false` in every epoch whose verified OTS block timestamp exceeds `deactivation`.
+   - Any violation constitutes an **audit failure**; the offending signed manifest(s) are themselves the evidence (see the `rotation_violation` challenge).
 
 ### Step 4: Validate Issued sum-MMR Sibling Walks
 
@@ -346,10 +372,10 @@ A naive threat model might suggest that a malicious mint could fabricate fake sp
 Instead, spent-side inflation is caught naturally by the **append-only nature of the MMR** and **keyset rotations/deactivations**:
 
 1. **Append-Only Immutability:** Once a leaf is appended to either MMR, it is permanent and cannot be deleted. If the mint fabricates a spend, that spent leaf is locked into history forever.
-2. **Keyset Rotation:** Eventually, keysets are deactivated and later expire. Once deactivated, no new ecash can be issued under that keyset, but existing ecash can still be spent until expiry. Once expired, no ecash can be issued or spent under that keyset.
+2. **Keyset Rotation:** Eventually, keysets are deactivated and later expire. Once deactivated, no new ecash can be issued under that keyset, but existing ecash can still be spent until expiry. Once expired, no ecash can be issued or spent under that keyset. The timing of deactivation is itself a signed commitment rather than a discretionary event (see Keyset Lifecycle Commitments).
 3. **Redemption Wind-Down:** As genuine users redeem their remaining ecash, the outstanding balance must mathematically wind down to 0. If the mint inflated the Spent MMR (claiming more ecash was spent than was actually issued to real users), the genuine outstanding tokens remaining in circulation will eventually exceed the _claimed_ remaining liabilities (or the claimed liabilities will become negative/insufficient to cover the real ecash redemptions). Because the mint cannot retroactively delete or rewrite their historical MMR leaves, they will be caught when they cannot honor valid redemptions or when their outstanding balance equation breaks.
 
-As a result, there are four recognized categories of Fraud Challenges, detailed below.
+As a result, there are five recognized categories of Fraud Challenges, detailed below.
 
 ---
 
@@ -455,6 +481,8 @@ As a result, there are four recognized categories of Fraud Challenges, detailed 
       "spent_mmr_root_hash": "7d4e...",
       "spent_mmr_root_sum": 9000,
       "outstanding_balance": 16000,
+      "active": true,
+      "deactivation": 1799999999,
       "mint_signature": "<signature_a>"
     },
     "manifest_b": {
@@ -469,6 +497,8 @@ As a result, there are four recognized categories of Fraud Challenges, detailed 
       "spent_mmr_root_hash": "7d4e...",
       "spent_mmr_root_sum": 9000,
       "outstanding_balance": 15000,
+      "active": true,
+      "deactivation": 1799999999,
       "mint_signature": "<signature_b>"
     }
   }
@@ -511,5 +541,33 @@ As a result, there are four recognized categories of Fraud Challenges, detailed 
 - **Mint's Defense / Response & Verification:**
   - **If the mint is NOT in the wrong:** The mint must respond to the challenge by publishing the **correct, valid MMR consistency proof** specified in the response schema (consisting of the list of sibling/peak proof hashes, sums, and heights) that mathematically merges the peaks of epoch `E_1` and the new elements to produce the peaks of epoch `E_2`.
   - **Verification:** Third parties verify the mint's published consistency proof against the root hashes and sums in the two signed manifests. If the proof successfully validates the deterministic transition, the challenge is refuted and proven false. Challenge discovery, notification, and response deadlines are coordination-policy concerns outside this NUT. Silence alone is not cryptographic proof of fraud; each third-party auditor decides whether a non-response is actionable under its published policy and only after the mint has acknowledged or otherwise verifiably received the challenge.
+
+---
+
+### 5. Keyset Rotation Violation (`rotation_violation`)
+
+- **Description:** The mint has broken a keyset lifecycle commitment (see Keyset Lifecycle Commitments): it reactivated a deactivated keyset, changed a declared `deactivation`, stayed active past its committed deadline, or grew the Issued MMR after the lock. Because every lifecycle rule is evaluated against signed manifests, every variant can be raised by third-party auditors without holding or revealing any ecash. Note that PoL receipts are not usable as evidence of post-lock issuance: `target_epoch` is an inclusion deadline, not a record of when issuance occurred, so post-lock issuance is proven through the Issued MMR itself (`issuance_after_lock`).
+- **Challenge Schema:**
+
+  ```json
+  {
+    "challenge_type": "rotation_violation",
+    "keyset_id": "009a6154b71113b7",
+    "violation_kind": "reactivation | issuance_after_lock | deactivation_overrun | declaration_drift",
+    "manifest_a": { "...": "..." },
+    "manifest_b": { "...": "..." }
+  }
+  ```
+
+  - Each presented manifest MUST include every field of the serialized manifest message so that third parties can reconstruct and verify its signed digest. The evidence required per `violation_kind`:
+  - `reactivation`: `manifest_a` and `manifest_b` for the same keyset with `manifest_a.epoch_index < manifest_b.epoch_index`, where `manifest_a.active` is `false` and `manifest_b.active` is `true`.
+  - `issuance_after_lock`: `manifest_a` with `active: false` and a later `manifest_b` whose `issued_mmr_size`, `issued_mmr_root_hash`, or `issued_mmr_root_sum` differs.
+  - `deactivation_overrun`: a single `manifest_a` with `active: true` whose own `timestamp` exceeds its `deactivation`; `manifest_b` is omitted.
+  - `declaration_drift`: `manifest_a` and `manifest_b` for the same keyset at different epochs with different `deactivation` values (for the same `epoch_index`, use `manifest_equivocation` instead).
+
+- **Mint's Defense / Response:**
+  - Third parties serialize each presented manifest as specified in Epoch Manifests, compute each SHA256 digest, and verify each BIP-340 signature against the mint's master NUT-06 public key. They then confirm that the stated `violation_kind` condition holds.
+  - There is **no valid response** or defense when the presented evidence verifies. Like manifest equivocation, any signed lifecycle violation is definitive proof of malicious behavior.
+  - **If the mint is NOT in the wrong:** The mint can only refute the challenge by demonstrating that one of the presented manifests fails signature verification.
 
 [tests]: tests/pol-tests.md
